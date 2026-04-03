@@ -7,6 +7,9 @@ set(${PROJECT_NAME}_MINOR "17")
 set(${PROJECT_NAME}_PATCH "7")
 set(IS_RELEASE TRUE)
 
+cmake_policy(SET CMP0148 OLD)
+execute_process(COMMAND "conda" "deactivate")
+
 if(IS_RELEASE)
     if(${PROJECT_NAME}_PATCH EQUAL 0)
         set(VERSION "${${PROJECT_NAME}_MAJOR}.${${PROJECT_NAME}_MINOR}")
