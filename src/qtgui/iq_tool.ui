@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>482</width>
-    <height>327</height>
+    <width>590</width>
+    <height>401</height>
    </rect>
   </property>
   <property name="sizePolicy">
@@ -40,22 +40,27 @@
       </widget>
      </item>
      <item>
-       <widget class="QComboBox" name="formatCombo">
-        <property name="toolTip">
-         <string>File format</string>
+      <widget class="QComboBox" name="formatCombo">
+       <property name="toolTip">
+        <string>File format</string>
+       </property>
+       <item>
+        <property name="text">
+         <string>Raw</string>
         </property>
-        <item>
-         <property name="text">
-          <string>Raw</string>
-         </property>
-        </item>
-        <item>
-         <property name="text">
-          <string>SigMF</string>
-         </property>
-        </item>
-       </widget>
-      </item>
+       </item>
+       <item>
+        <property name="text">
+         <string>mkfifo</string>
+        </property>
+       </item>
+       <item>
+        <property name="text">
+         <string>SigMF</string>
+        </property>
+       </item>
+      </widget>
+     </item>
      <item>
       <widget class="QLabel" name="recDirLabel">
        <property name="text">
@@ -179,7 +184,7 @@
      <item>
       <spacer name="horizontalSpacer">
        <property name="orientation">
-        <enum>Qt::Horizontal</enum>
+        <enum>Qt::Orientation::Horizontal</enum>
        </property>
        <property name="sizeHint" stdset="0">
         <size>
@@ -195,14 +200,14 @@
         <string>00:00:00 / 00:00:00</string>
        </property>
        <property name="alignment">
-        <set>Qt::AlignCenter</set>
+        <set>Qt::AlignmentFlag::AlignCenter</set>
        </property>
       </widget>
      </item>
      <item>
       <spacer name="horizontalSpacer_2">
        <property name="orientation">
-        <enum>Qt::Horizontal</enum>
+        <enum>Qt::Orientation::Horizontal</enum>
        </property>
        <property name="sizeHint" stdset="0">
         <size>
@@ -229,7 +234,7 @@
       <number>60</number>
      </property>
      <property name="orientation">
-      <enum>Qt::Horizontal</enum>
+      <enum>Qt::Orientation::Horizontal</enum>
      </property>
     </widget>
    </item>

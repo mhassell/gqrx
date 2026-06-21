@@ -1649,6 +1649,7 @@ void MainWindow::startIqRecording(const QString& recdir, const QString& format)
     auto currentDate = QDateTime::currentDateTimeUtc();
     auto filenameTemplate = currentDate.toString("%1/gqrx_yyyyMMdd_hhmmss_%2_%3_fc.%4").arg(recdir).arg(freq).arg(sr/dec);
     bool sigmf = (format == "SigMF");
+    bool fifo = (format == "mkfifo");
     auto lastRec = filenameTemplate.arg(sigmf ? "sigmf-data" : "raw");
 
     QFile metaFile(filenameTemplate.arg("sigmf-meta"));
@@ -1677,6 +1678,12 @@ void MainWindow::startIqRecording(const QString& recdir, const QString& format)
         if (!metaFile.open(QIODevice::WriteOnly) || metaFile.write(meta) != meta.size()) {
             ok = false;
         }
+    }
+
+    if (fifo)
+    {
+        system("mkfifo /tmp/iq");
+        lastRec = QString("/tmp/iq");
     }
 
     // start recorder; fails if recording already in progress
