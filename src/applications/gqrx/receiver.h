@@ -46,6 +46,7 @@
 #include "dsp/resampler_xx.h"
 #include "interfaces/udp_sink_f.h"
 #include "receivers/receiver_base.h"
+#include "applications/gqrx/shm_iq_sink.hpp"
 
 #ifdef WITH_PULSEAUDIO
 #include "pulseaudio/pa_sink.h"
@@ -275,6 +276,7 @@ private:
     gr::blocks::multiply_const_ff::sptr wav_gain1; /*!< WAV file gain block. */
 
     gr::blocks::file_sink::sptr         iq_sink;     /*!< I/Q file sink. */
+    shm_iq_sink::sptr                   shm_sink;    /*!< Shared memory I/Q sink. */
 
     gr::blocks::wavfile_sink::sptr      wav_sink;   /*!< WAV file sink for recording. */
     gr::blocks::wavfile_source::sptr    wav_src;    /*!< WAV file source for playback. */
