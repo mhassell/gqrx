@@ -14,6 +14,11 @@ add_source_files(SRCS_LIST
 	gqrx/recentconfig.cpp
 	gqrx/recentconfig.h
 	gqrx/file_resources.cpp
+	gqrx/shm_ringbuf.cpp
+	gqrx/shm_ringbuf.hpp
+	gqrx/shm_iq_sink.cpp
+	gqrx/shm_iq_sink_impl.cpp
+	gqrx/shm_iq_sink_impl.h
 )
 
 #######################################################################################################################
