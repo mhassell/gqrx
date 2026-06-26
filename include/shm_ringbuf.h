@@ -10,6 +10,10 @@
 #include <fcntl.h>
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define SHM_RINGBUF_NAME "/gqrx_iq_ringbuf"
 #define SHM_RINGBUF_MAGIC 0x52494E47  /* 'RING' */
 #define SHM_RINGBUF_VERSION 1
@@ -84,5 +88,9 @@ ssize_t shm_ringbuf_write(shm_ringbuf_t *ctx, const void *data, size_t len);
  * @return Number of bytes read, 0 if no data, -1 on error
  */
 ssize_t shm_ringbuf_read(shm_ringbuf_t *ctx, void *out_buf, size_t max_len, int timeout_ms);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SHM_RINGBUF_H */
