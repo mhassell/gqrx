@@ -42,8 +42,10 @@ int shm_iq_sink_impl::work(int noutput_items,
     for (int i = 0; i < noutput_items; i++) {
         uint8_t cu8[2];
         /* Scale from [-1, 1] to [0, 255] with proper centering */
-        cu8[0] = (uint8_t)(std::max(-1.0, std::min(1.0, in[i].real())) * 127.0 + 128.0);
-        cu8[1] = (uint8_t)(std::max(-1.0, std::min(1.0, in[i].imag())) * 127.0 + 128.0);
+        double i_val = std::max(-1.0, std::min(1.0, (double)in[i].real())) * 127.0 + 128.0;
+        double q_val = std::max(-1.0, std::min(1.0, (double)in[i].imag())) * 127.0 + 128.0;
+        cu8[0] = (uint8_t)i_val;
+        cu8[1] = (uint8_t)q_val;
         
         if (ringbuf_->write(cu8, 2) < 0) {
             std::cerr << "Ring buffer write failed" << std::endl;
