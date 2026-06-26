@@ -16,7 +16,9 @@ add_source_files(SRCS_LIST
 	gqrx/file_resources.cpp
 	gqrx/shm_ringbuf.cpp
 	gqrx/shm_ringbuf.hpp
+	gqrx/shm_ringbuf_impl.cpp
 	gqrx/shm_iq_sink.cpp
+	gqrx/shm_iq_sink.hpp
 	gqrx/shm_iq_sink_impl.cpp
 	gqrx/shm_iq_sink_impl.h
 )
