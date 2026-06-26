@@ -125,6 +125,16 @@ receiver::receiver(const std::string input_device,
 
     audio_udp_sink = make_udp_sink_f();
 
+    /* Create shared memory IQ sink */
+    try {
+        shm_sink = shm_iq_sink::make((unsigned long)d_input_rate);
+        std::cout << "Shared memory IQ sink created successfully" << std::endl;
+    }
+    catch (const std::exception &e) {
+        std::cerr << "Warning: Failed to create shared memory IQ sink: " << e.what() << std::endl;
+        shm_sink.reset();
+    }
+
 #ifdef WITH_PULSEAUDIO
     audio_snk = make_pa_sink(audio_device, d_audio_rate, "GQRX", "Audio output");
 #elif WITH_PORTAUDIO
@@ -1222,6 +1232,22 @@ receiver::status receiver::start_iq_recording(const std::string filename)
         tb->connect(input_decim, 0, iq_sink, 0);
     else
         tb->connect(src, 0, iq_sink, 0);
+    
+    /* Also start shared memory streaming */
+    if (shm_sink)
+    {
+        try {
+            if (d_decim >= 2)
+                tb->connect(input_decim, 0, shm_sink, 0);
+            else
+                tb->connect(src, 0, shm_sink, 0);
+            std::cout << "Shared memory I/Q streaming started" << std::endl;
+        }
+        catch (const std::exception &e) {
+            std::cerr << "Warning: Could not connect shared memory sink: " << e.what() << std::endl;
+        }
+    }
+    
     d_recording_iq = true;
     tb->unlock();
 
@@ -1243,6 +1269,21 @@ receiver::status receiver::stop_iq_recording()
         tb->disconnect(input_decim, 0, iq_sink, 0);
     else
         tb->disconnect(src, 0, iq_sink, 0);
+
+    /* Disconnect shared memory sink */
+    if (shm_sink)
+    {
+        try {
+            if (d_decim >= 2)
+                tb->disconnect(input_decim, 0, shm_sink, 0);
+            else
+                tb->disconnect(src, 0, shm_sink, 0);
+            std::cout << "Shared memory I/Q streaming stopped" << std::endl;
+        }
+        catch (const std::exception &e) {
+            std::cerr << "Warning: Error disconnecting shared memory sink: " << e.what() << std::endl;
+        }
+    }
 
     tb->unlock();
     iq_sink.reset();
@@ -1351,6 +1392,17 @@ void receiver::connect_all(rx_chain type)
     {
         // We record IQ with minimal pre-processing
         tb->connect(b, 0, iq_sink, 0);
+        
+        // Also stream to shared memory
+        if (shm_sink)
+        {
+            try {
+                tb->connect(b, 0, shm_sink, 0);
+            }
+            catch (const std::exception &e) {
+                std::cerr << "Warning: Could not connect shared memory sink in connect_all: " << e.what() << std::endl;
+            }
+        }
     }
 
     tb->connect(b, 0, iq_swap, 0);
