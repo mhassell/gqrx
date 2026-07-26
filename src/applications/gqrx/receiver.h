@@ -252,14 +252,14 @@ private:
     bool        d_iq_rev;           /*!< Whether I/Q is reversed or not. */
     bool        d_dc_cancel;        /*!< Enable automatic DC removal. */
     bool        d_iq_balance;       /*!< Enable automatic IQ balance. */
-#ifdef WITH_SHM_IQ_SINK
-    bool        shm_connected_;     /*!< Whether shm_sink is currently in the flow graph. */
-#endif
 
     std::string input_devstr;  /*!< Current input device string. */
     std::string output_devstr; /*!< Current output device string. */
 
     rx_demod    d_demod;       /*!< Current demodulator. */
+#ifdef WITH_SHM_IQ_SINK
+    bool        shm_connected_;     /*!< Whether shm_sink is currently in the flow graph. */
+#endif
 
     gr::top_block_sptr         tb;        /*!< The GNU Radio top block. */
 
