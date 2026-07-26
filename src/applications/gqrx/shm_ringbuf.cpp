@@ -23,7 +23,6 @@
  * On older toolchains fall back to a direct syscall.
  * MFD_CLOEXEC may not be defined on older kernel headers; define it if absent.
  * -------------------------------------------------------------------------*/
-#include <sys/syscall.h>
 #ifndef MFD_CLOEXEC
 # define MFD_CLOEXEC 1u
 #endif
@@ -209,9 +208,21 @@ int shm_ringbuf_prepare_child_fds(shm_ringbuf_t *ctx)
 
     /* dup() the fds without FD_CLOEXEC so they survive exec() */
     int m2 = dup(ctx->memfd);
-    if (m2 < 0) { perror("shm_ringbuf: dup memfd"); return -1; }
+    if (m2 < 0) {
+        perror("shm_ringbuf: dup memfd");
+        /* Clear any stale env vars from a previous (failed) call */
+        unsetenv(GQRX_IQ_MEMFD_ENV);
+        unsetenv(GQRX_IQ_EVENTFD_ENV);
+        return -1;
+    }
     int e2 = dup(ctx->event_fd);
-    if (e2 < 0) { perror("shm_ringbuf: dup eventfd"); close(m2); return -1; }
+    if (e2 < 0) {
+        perror("shm_ringbuf: dup eventfd");
+        close(m2);
+        unsetenv(GQRX_IQ_MEMFD_ENV);
+        unsetenv(GQRX_IQ_EVENTFD_ENV);
+        return -1;
+    }
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", m2);

@@ -227,5 +227,5 @@ shm_ringbuf_close(&ctx);
   UINT64_MAX − 1.  A very fast producer writing tiny blocks will eventually hit
   this limit; the recommended mitigation is to batch writes (already done in the
   `shm_iq_sink`).
-- `WITH_SHM_IQ_SINK` defaults to `OFF` on non-Linux platforms since
-  `memfd_create` and `eventfd` are Linux-specific.
+- `WITH_SHM_IQ_SINK` is forced to `OFF` on non-Linux platforms since
+  `memfd_create` and `eventfd` are Linux-specific (defaults to `ON` on Linux).
