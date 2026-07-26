@@ -1,9 +1,47 @@
+/*
+ * shm_ringbuf.cpp — lock-free SPSC ring buffer over memfd_create + eventfd.
+ *
+ * See include/shm_ringbuf.h for the full design/protocol description.
+ */
+
 #include "shm_ringbuf.h"
+
 #include <string.h>
 #include <errno.h>
-#include <sys/eventfd.h>
+#include <stdlib.h>
+#include <inttypes.h>
 
-int shm_ringbuf_create(size_t bufsize, uint32_t sample_rate, uint32_t sample_size, shm_ringbuf_t *out_ctx)
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+#include <poll.h>
+
+/* ---------------------------------------------------------------------------
+ * memfd_create compat — use glibc's declaration when available (glibc >= 2.27,
+ * where it appears via <bits/mman-shared.h> pulled in by <sys/mman.h>).
+ * On older toolchains fall back to a direct syscall.
+ * MFD_CLOEXEC may not be defined on older kernel headers; define it if absent.
+ * -------------------------------------------------------------------------*/
+#include <sys/syscall.h>
+#ifndef MFD_CLOEXEC
+# define MFD_CLOEXEC 1u
+#endif
+/* If glibc >= 2.27 memfd_create is already declared via <sys/mman.h> → nothing
+ * to do.  Otherwise provide a thin syscall wrapper under a private name to
+ * avoid clashing with a later extern declaration. */
+#if !defined(__GLIBC__) || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 27)
+static inline int memfd_create(const char *name, unsigned int flags)
+{
+    return (int)syscall(SYS_memfd_create, name, flags);
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_create
+ * -------------------------------------------------------------------------*/
+int shm_ringbuf_create(size_t bufsize, uint32_t sample_rate, uint32_t sample_size,
+                       shm_ringbuf_t *out_ctx)
 {
     if (!out_ctx || bufsize == 0) {
         errno = EINVAL;
@@ -11,142 +49,267 @@ int shm_ringbuf_create(size_t bufsize, uint32_t sample_rate, uint32_t sample_siz
     }
 
     memset(out_ctx, 0, sizeof(*out_ctx));
+    out_ctx->memfd    = -1;
+    out_ctx->event_fd = -1;
 
-    /* Unlink any existing shared memory (clean slate) */
-    shm_unlink(SHM_RINGBUF_NAME);
-
-    /* Create shared memory object */
-    int shm_fd = shm_open(SHM_RINGBUF_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd < 0) {
-        perror("shm_open");
+    /* Create anonymous shared memory fd */
+    int mfd = memfd_create(MEMFD_RINGBUF_NAME, MFD_CLOEXEC);
+    if (mfd < 0) {
+        perror("shm_ringbuf: memfd_create");
         return -1;
     }
 
     size_t total_size = sizeof(shm_ringbuf_header_t) + bufsize;
-
-    /* Set the size */
-    if (ftruncate(shm_fd, total_size) < 0) {
-        perror("ftruncate");
-        close(shm_fd);
-        shm_unlink(SHM_RINGBUF_NAME);
+    if (ftruncate(mfd, (off_t)total_size) < 0) {
+        perror("shm_ringbuf: ftruncate");
+        close(mfd);
         return -1;
     }
 
-    /* Map the shared memory */
-    void *region = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    void *region = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
     if (region == MAP_FAILED) {
-        perror("mmap");
-        close(shm_fd);
-        shm_unlink(SHM_RINGBUF_NAME);
+        perror("shm_ringbuf: mmap");
+        close(mfd);
         return -1;
     }
 
-    /* Initialize the context */
-    out_ctx->shm_fd = shm_fd;
-    out_ctx->region = region;
-    out_ctx->region_size = total_size;
-    out_ctx->hdr = (shm_ringbuf_header_t *)region;
-    out_ctx->buffer = (uint8_t *)region + sizeof(shm_ringbuf_header_t);
+    /* Producer→consumer "data available" notification fd.
+     * EFD_SEMAPHORE: each read drains exactly 1 token.
+     * EFD_NONBLOCK: writes in shm_ringbuf_write() never block. */
+    int efd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE | EFD_NONBLOCK);
+    if (efd < 0) {
+        perror("shm_ringbuf: eventfd");
+        munmap(region, total_size);
+        close(mfd);
+        return -1;
+    }
 
-    /* Initialize the header */
-    out_ctx->hdr->magic = SHM_RINGBUF_MAGIC;
-    out_ctx->hdr->version = SHM_RINGBUF_VERSION;
-    out_ctx->hdr->head = 0;
-    out_ctx->hdr->tail = 0;
-    out_ctx->hdr->bufsize = bufsize;
+    out_ctx->memfd       = mfd;
+    out_ctx->event_fd    = efd;
+    out_ctx->region      = region;
+    out_ctx->region_size = total_size;
+    out_ctx->hdr         = (shm_ringbuf_header_t *)region;
+    out_ctx->buffer      = (uint8_t *)region + sizeof(shm_ringbuf_header_t);
+
+    out_ctx->hdr->magic       = SHM_RINGBUF_MAGIC;
+    out_ctx->hdr->version     = SHM_RINGBUF_VERSION;
+    out_ctx->hdr->head        = 0;
+    out_ctx->hdr->tail        = 0;
+    out_ctx->hdr->bufsize     = (uint64_t)bufsize;
     out_ctx->hdr->sample_rate = sample_rate;
     out_ctx->hdr->sample_size = sample_size;
 
-    fprintf(stderr, "[SHM] Created ring buffer: %s (size=%zu, sample_rate=%u, sample_size=%u)\n",
-            SHM_RINGBUF_NAME, bufsize, sample_rate, sample_size);
+    fprintf(stderr,
+            "[SHM] Created ring buffer: memfd=%d eventfd=%d "
+            "(bufsize=%zu sample_rate=%u sample_size=%u)\n",
+            mfd, efd, bufsize, sample_rate, sample_size);
+    fprintf(stderr,
+            "[SHM] Consumer fd discovery:\n"
+            "[SHM]   Child  process: %s=%d %s=%d (set before exec)\n"
+            "[SHM]   Unrelated proc: connect to Unix socket %s (or $%s) "
+            "after calling shm_ringbuf_send_fds()\n",
+            GQRX_IQ_MEMFD_ENV,   mfd,
+            GQRX_IQ_EVENTFD_ENV, efd,
+            GQRX_IQ_SOCK_DEFAULT, GQRX_IQ_SOCK_ENV);
 
     return 0;
 }
 
-int shm_ringbuf_open(shm_ringbuf_t *out_ctx)
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_attach  (consumer side)
+ * -------------------------------------------------------------------------*/
+int shm_ringbuf_attach(int memfd, int event_fd, shm_ringbuf_t *out_ctx)
 {
-    if (!out_ctx) {
+    if (!out_ctx || memfd < 0) {
         errno = EINVAL;
         return -1;
     }
 
     memset(out_ctx, 0, sizeof(*out_ctx));
+    out_ctx->memfd    = memfd;
+    out_ctx->event_fd = event_fd;
 
-    /* Open existing shared memory */
-    int shm_fd = shm_open(SHM_RINGBUF_NAME, O_RDWR, 0);
-    if (shm_fd < 0) {
-        perror("shm_open");
-        fprintf(stderr, "[SHM] Failed to open: %s\n", SHM_RINGBUF_NAME);
-        return -1;
-    }
-
-    /* Get the size via fstat */
     struct stat sb;
-    if (fstat(shm_fd, &sb) < 0) {
-        perror("fstat");
-        close(shm_fd);
+    if (fstat(memfd, &sb) < 0) {
+        perror("shm_ringbuf: fstat");
         return -1;
     }
+    size_t total_size = (size_t)sb.st_size;
 
-    size_t total_size = sb.st_size;
-
-    /* Map the shared memory */
-    void *region = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    void *region = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
     if (region == MAP_FAILED) {
-        perror("mmap");
-        close(shm_fd);
+        perror("shm_ringbuf: mmap");
         return -1;
     }
 
-    /* Initialize the context */
-    out_ctx->shm_fd = shm_fd;
-    out_ctx->region = region;
+    out_ctx->region      = region;
     out_ctx->region_size = total_size;
-    out_ctx->hdr = (shm_ringbuf_header_t *)region;
-    out_ctx->buffer = (uint8_t *)region + sizeof(shm_ringbuf_header_t);
+    out_ctx->hdr         = (shm_ringbuf_header_t *)region;
+    out_ctx->buffer      = (uint8_t *)region + sizeof(shm_ringbuf_header_t);
 
-    /* Validate the header */
     if (out_ctx->hdr->magic != SHM_RINGBUF_MAGIC) {
-        fprintf(stderr, "[SHM] Invalid ring buffer magic (got 0x%x, expected 0x%x)\n",
+        fprintf(stderr, "[SHM] Bad magic 0x%x (expected 0x%x)\n",
                 out_ctx->hdr->magic, SHM_RINGBUF_MAGIC);
         munmap(region, total_size);
-        close(shm_fd);
         return -1;
     }
 
-    fprintf(stderr, "[SHM] Opened ring buffer: %s (size=%zu, sample_rate=%u, sample_size=%u)\n",
-            SHM_RINGBUF_NAME, out_ctx->hdr->bufsize, 
-            out_ctx->hdr->sample_rate, out_ctx->hdr->sample_size);
-
+    fprintf(stderr,
+            "[SHM] Attached: memfd=%d eventfd=%d "
+            "(bufsize=%" PRIu64 " sample_rate=%u sample_size=%u)\n",
+            memfd, event_fd,
+            out_ctx->hdr->bufsize,
+            out_ctx->hdr->sample_rate,
+            out_ctx->hdr->sample_size);
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_close
+ * -------------------------------------------------------------------------*/
 int shm_ringbuf_close(shm_ringbuf_t *ctx)
 {
-    if (!ctx || ctx->region == NULL) {
+    if (!ctx || ctx->region == NULL)
         return 0;
-    }
 
-    if (munmap(ctx->region, ctx->region_size) < 0) {
-        perror("munmap");
-        return -1;
-    }
+    if (munmap(ctx->region, ctx->region_size) < 0)
+        perror("shm_ringbuf: munmap");
 
-    if (close(ctx->shm_fd) < 0) {
-        perror("close");
-        return -1;
-    }
+    if (ctx->memfd >= 0)
+        close(ctx->memfd);
+    if (ctx->event_fd >= 0)
+        close(ctx->event_fd);
 
     memset(ctx, 0, sizeof(*ctx));
+    ctx->memfd    = -1;
+    ctx->event_fd = -1;
     return 0;
 }
 
-void shm_ringbuf_destroy(void)
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_destroy
+ * -------------------------------------------------------------------------*/
+void shm_ringbuf_destroy(shm_ringbuf_t *ctx)
 {
-    shm_unlink(SHM_RINGBUF_NAME);
-    fprintf(stderr, "[SHM] Destroyed ring buffer: %s\n", SHM_RINGBUF_NAME);
+    /* With memfd_create there is no filesystem name to unlink.
+     * Closing the last fd referencing the memfd reclaims the memory. */
+    shm_ringbuf_close(ctx);
+    fprintf(stderr, "[SHM] Destroyed memfd ring buffer\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_prepare_child_fds
+ * -------------------------------------------------------------------------*/
+int shm_ringbuf_prepare_child_fds(shm_ringbuf_t *ctx)
+{
+    if (!ctx || ctx->memfd < 0 || ctx->event_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* dup() the fds without FD_CLOEXEC so they survive exec() */
+    int m2 = dup(ctx->memfd);
+    if (m2 < 0) { perror("shm_ringbuf: dup memfd"); return -1; }
+    int e2 = dup(ctx->event_fd);
+    if (e2 < 0) { perror("shm_ringbuf: dup eventfd"); close(m2); return -1; }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", m2);
+    setenv(GQRX_IQ_MEMFD_ENV, buf, 1);
+    snprintf(buf, sizeof(buf), "%d", e2);
+    setenv(GQRX_IQ_EVENTFD_ENV, buf, 1);
+
+    fprintf(stderr, "[SHM] Child fds prepared: %s=%d %s=%d\n",
+            GQRX_IQ_MEMFD_ENV, m2, GQRX_IQ_EVENTFD_ENV, e2);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_send_fds  (SCM_RIGHTS handoff to an unrelated process)
+ * -------------------------------------------------------------------------*/
+int shm_ringbuf_send_fds(shm_ringbuf_t *ctx, const char *path)
+{
+    if (!ctx || ctx->memfd < 0 || ctx->event_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!path) {
+        path = getenv(GQRX_IQ_SOCK_ENV);
+        if (!path)
+            path = GQRX_IQ_SOCK_DEFAULT;
+    }
+
+    int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (srv < 0) { perror("shm_ringbuf: socket"); return -1; }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    /* Remove any stale socket file */
+    unlink(path);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("shm_ringbuf: bind");
+        close(srv);
+        return -1;
+    }
+    if (listen(srv, 1) < 0) {
+        perror("shm_ringbuf: listen");
+        close(srv);
+        unlink(path);
+        return -1;
+    }
+
+    fprintf(stderr, "[SHM] Waiting for consumer on %s ...\n", path);
+    int cli = accept(srv, NULL, NULL);
+    close(srv);
+    unlink(path);
+
+    if (cli < 0) { perror("shm_ringbuf: accept"); return -1; }
+
+    /* Build SCM_RIGHTS ancillary message carrying both fds */
+    int fds[2] = { ctx->memfd, ctx->event_fd };
+    char dummy[1] = { 0 };
+    struct iovec iov = { .iov_base = dummy, .iov_len = 1 };
+
+    union {
+        struct cmsghdr cm;
+        char ctrl[CMSG_SPACE(2 * sizeof(int))];
+    } ctrl_un;
+    memset(&ctrl_un, 0, sizeof(ctrl_un));
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = ctrl_un.ctrl;
+    msg.msg_controllen = sizeof(ctrl_un.ctrl);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_len   = CMSG_LEN(2 * sizeof(int));
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type  = SCM_RIGHTS;
+    memcpy(CMSG_DATA(cmsg), fds, 2 * sizeof(int));
+
+    int ret = 0;
+    if (sendmsg(cli, &msg, 0) < 0) {
+        perror("shm_ringbuf: sendmsg");
+        ret = -1;
+    } else {
+        fprintf(stderr, "[SHM] Sent memfd=%d eventfd=%d to consumer via %s\n",
+                ctx->memfd, ctx->event_fd, path);
+    }
+
+    close(cli);
+    return ret;
+}
+
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_available / shm_ringbuf_free
+ * -------------------------------------------------------------------------*/
 size_t shm_ringbuf_available(const shm_ringbuf_t *ctx)
 {
     if (!ctx || !ctx->hdr) return 0;
@@ -158,10 +321,12 @@ size_t shm_ringbuf_available(const shm_ringbuf_t *ctx)
 size_t shm_ringbuf_free(const shm_ringbuf_t *ctx)
 {
     if (!ctx || !ctx->hdr) return 0;
-    size_t bufsize = ctx->hdr->bufsize;
-    return bufsize - shm_ringbuf_available(ctx);
+    return (size_t)(ctx->hdr->bufsize - (uint64_t)shm_ringbuf_available(ctx));
 }
 
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_write
+ * -------------------------------------------------------------------------*/
 ssize_t shm_ringbuf_write(shm_ringbuf_t *ctx, const void *data, size_t len)
 {
     if (!ctx || !ctx->hdr || !data || len == 0) {
@@ -169,76 +334,87 @@ ssize_t shm_ringbuf_write(shm_ringbuf_t *ctx, const void *data, size_t len)
         return -1;
     }
 
-    size_t bufsize = ctx->hdr->bufsize;
-    size_t free_space = shm_ringbuf_free(ctx);
+    uint64_t bufsize  = ctx->hdr->bufsize;
+    size_t   free_sp  = shm_ringbuf_free(ctx);
 
-    if (free_space == 0) {
+    if (free_sp == 0) {
         errno = EAGAIN;
-        return -1;  /* Buffer full */
+        return -1;  /* buffer full */
     }
 
-    /* Clamp to available free space */
-    size_t to_write = (len <= free_space) ? len : free_space;
+    size_t to_write = (len <= free_sp) ? len : free_sp;
 
-    uint64_t head = __atomic_load_n(&ctx->hdr->head, __ATOMIC_ACQUIRE);
-    size_t write_pos = head % bufsize;
-    size_t space_to_end = bufsize - write_pos;
+    uint64_t head      = __atomic_load_n(&ctx->hdr->head, __ATOMIC_ACQUIRE);
+    size_t   write_pos = (size_t)(head % bufsize);
+    size_t   to_end    = (size_t)bufsize - write_pos;
 
-    if (to_write <= space_to_end) {
-        /* Write doesn't wrap around */
+    if (to_write <= to_end) {
         memcpy(&ctx->buffer[write_pos], data, to_write);
     } else {
-        /* Write wraps around the ring */
-        size_t first_part = space_to_end;
-        size_t second_part = to_write - first_part;
-        memcpy(&ctx->buffer[write_pos], data, first_part);
-        memcpy(&ctx->buffer[0], (uint8_t *)data + first_part, second_part);
+        memcpy(&ctx->buffer[write_pos], data, to_end);
+        memcpy(&ctx->buffer[0], (const uint8_t *)data + to_end, to_write - to_end);
     }
 
-    /* Update head pointer */
     __atomic_add_fetch(&ctx->hdr->head, to_write, __ATOMIC_RELEASE);
 
-    return to_write;
+    /* Signal consumer: one token per write call.  Silently ignore EAGAIN if
+     * the eventfd counter has saturated at UINT64_MAX - 1. */
+    if (ctx->event_fd >= 0) {
+        uint64_t one = 1;
+        ssize_t n = write(ctx->event_fd, &one, sizeof(one));
+        (void)n;
+    }
+
+    return (ssize_t)to_write;
 }
 
-ssize_t shm_ringbuf_read(shm_ringbuf_t *ctx, void *out_buf, size_t max_len, int timeout_ms)
+/* ---------------------------------------------------------------------------
+ * shm_ringbuf_read
+ * -------------------------------------------------------------------------*/
+ssize_t shm_ringbuf_read(shm_ringbuf_t *ctx, void *out_buf, size_t max_len,
+                         int timeout_ms)
 {
     if (!ctx || !ctx->hdr || !out_buf || max_len == 0) {
         errno = EINVAL;
         return -1;
     }
 
-    size_t bufsize = ctx->hdr->bufsize;
-    size_t available = shm_ringbuf_available(ctx);
+    /* Block until data is available (or timeout) using poll() on eventfd */
+    if (ctx->event_fd >= 0 && shm_ringbuf_available(ctx) == 0 && timeout_ms != 0) {
+        struct pollfd pfd;
+        pfd.fd      = ctx->event_fd;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
 
-    if (available == 0) {
-        if (timeout_ms == 0) {
-            return 0;  /* Non-blocking: return immediately */
-        }
-        /* TODO: Could add eventfd-based waiting here for blocking reads */
-        return 0;
+        int r = poll(&pfd, 1, timeout_ms);   /* timeout_ms == -1 → infinite */
+        if (r <= 0)
+            return 0;   /* timeout or signal */
+
+        /* Drain one semaphore token */
+        uint64_t val;
+        ssize_t n = read(ctx->event_fd, &val, sizeof(val));
+        (void)n;
     }
 
-    /* Clamp to max_len */
-    size_t to_read = (max_len <= available) ? max_len : available;
+    uint64_t bufsize  = ctx->hdr->bufsize;
+    size_t   avail    = shm_ringbuf_available(ctx);
 
-    uint64_t tail = __atomic_load_n(&ctx->hdr->tail, __ATOMIC_ACQUIRE);
-    size_t read_pos = tail % bufsize;
-    size_t space_to_end = bufsize - read_pos;
+    if (avail == 0)
+        return 0;
 
-    if (to_read <= space_to_end) {
-        /* Read doesn't wrap around */
+    size_t   to_read  = (max_len <= avail) ? max_len : avail;
+    uint64_t tail     = __atomic_load_n(&ctx->hdr->tail, __ATOMIC_ACQUIRE);
+    size_t   read_pos = (size_t)(tail % bufsize);
+    size_t   to_end   = (size_t)bufsize - read_pos;
+
+    if (to_read <= to_end) {
         memcpy(out_buf, &ctx->buffer[read_pos], to_read);
     } else {
-        /* Read wraps around the ring */
-        size_t first_part = space_to_end;
-        size_t second_part = to_read - first_part;
-        memcpy(out_buf, &ctx->buffer[read_pos], first_part);
-        memcpy((uint8_t *)out_buf + first_part, &ctx->buffer[0], second_part);
+        memcpy(out_buf, &ctx->buffer[read_pos], to_end);
+        memcpy((uint8_t *)out_buf + to_end, &ctx->buffer[0], to_read - to_end);
     }
 
-    /* Update tail pointer */
     __atomic_add_fetch(&ctx->hdr->tail, to_read, __ATOMIC_RELEASE);
 
-    return to_read;
+    return (ssize_t)to_read;
 }

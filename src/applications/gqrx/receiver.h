@@ -46,7 +46,9 @@
 #include "dsp/resampler_xx.h"
 #include "interfaces/udp_sink_f.h"
 #include "receivers/receiver_base.h"
-#include "applications/gqrx/shm_iq_sink.hpp"
+#ifdef WITH_SHM_IQ_SINK
+# include "applications/gqrx/shm_iq_sink.hpp"
+#endif
 
 #ifdef WITH_PULSEAUDIO
 #include "pulseaudio/pa_sink.h"
@@ -250,6 +252,9 @@ private:
     bool        d_iq_rev;           /*!< Whether I/Q is reversed or not. */
     bool        d_dc_cancel;        /*!< Enable automatic DC removal. */
     bool        d_iq_balance;       /*!< Enable automatic IQ balance. */
+#ifdef WITH_SHM_IQ_SINK
+    bool        shm_connected_;     /*!< Whether shm_sink is currently in the flow graph. */
+#endif
 
     std::string input_devstr;  /*!< Current input device string. */
     std::string output_devstr; /*!< Current output device string. */
@@ -276,7 +281,9 @@ private:
     gr::blocks::multiply_const_ff::sptr wav_gain1; /*!< WAV file gain block. */
 
     gr::blocks::file_sink::sptr         iq_sink;     /*!< I/Q file sink. */
+#ifdef WITH_SHM_IQ_SINK
     shm_iq_sink::sptr                   shm_sink;    /*!< Shared memory I/Q sink. */
+#endif
 
     gr::blocks::wavfile_sink::sptr      wav_sink;   /*!< WAV file sink for recording. */
     gr::blocks::wavfile_source::sptr    wav_src;    /*!< WAV file source for playback. */

@@ -1,26 +1,30 @@
 #include "shm_ringbuf.hpp"
 #include <iostream>
 #include <stdexcept>
+#include <cstring>
 
 ShmRingbuf::ShmRingbuf(size_t bufsize_bytes, uint32_t sample_rate, uint32_t sample_size)
 {
-    if (shm_ringbuf_create(bufsize_bytes, sample_rate, sample_size, &ctx_) < 0) {
-        throw std::runtime_error("Failed to create shared memory ring buffer");
-    }
+    memset(&ctx_, 0, sizeof(ctx_));
+    ctx_.memfd    = -1;
+    ctx_.event_fd = -1;
+    if (shm_ringbuf_create(bufsize_bytes, sample_rate, sample_size, &ctx_) < 0)
+        throw std::runtime_error("Failed to create memfd ring buffer");
 }
 
-ShmRingbuf::ShmRingbuf()
+ShmRingbuf::ShmRingbuf(int memfd, int event_fd)
 {
-    if (shm_ringbuf_open(&ctx_) < 0) {
-        throw std::runtime_error("Failed to open shared memory ring buffer");
-    }
+    memset(&ctx_, 0, sizeof(ctx_));
+    ctx_.memfd    = -1;
+    ctx_.event_fd = -1;
+    if (shm_ringbuf_attach(memfd, event_fd, &ctx_) < 0)
+        throw std::runtime_error("Failed to attach to memfd ring buffer");
 }
 
 ShmRingbuf::~ShmRingbuf()
 {
-    if (ctx_.region) {
+    if (ctx_.region)
         shm_ringbuf_close(&ctx_);
-    }
 }
 
 ssize_t ShmRingbuf::write(const void *data, size_t len)

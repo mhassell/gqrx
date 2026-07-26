@@ -245,6 +245,20 @@ if(CUSTOM_AIRSPY_KERNELS)
     add_definitions(-DCUSTOM_AIRSPY_KERNELS)
 endif(CUSTOM_AIRSPY_KERNELS)
 
+# Shared-memory IQ streaming sink (Linux only — requires memfd_create + eventfd)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    option(WITH_SHM_IQ_SINK "Enable shared-memory IQ streaming sink (Linux only)" ON)
+else()
+    option(WITH_SHM_IQ_SINK "Enable shared-memory IQ streaming sink (Linux only)" OFF)
+endif()
+if(WITH_SHM_IQ_SINK)
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "Linux")
+        message(FATAL_ERROR "WITH_SHM_IQ_SINK requires Linux (memfd_create + eventfd)")
+    endif()
+    message(STATUS "Shared-memory IQ sink enabled")
+    add_definitions(-DWITH_SHM_IQ_SINK)
+endif()
+
 
 # Tell CMake to run moc when necessary:
 set(CMAKE_AUTOMOC ON)

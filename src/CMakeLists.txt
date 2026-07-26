@@ -100,6 +100,12 @@ target_link_libraries(${PROJECT_NAME}
     ${PORTAUDIO_LIBRARIES}
 )
 
+# memfd_create / eventfd / shm_open live in librt on older glibc (glibc < 2.17).
+# On modern systems it is a no-op link but harmless.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND WITH_SHM_IQ_SINK)
+    target_link_libraries(${PROJECT_NAME} rt)
+endif()
+
 if(NOT Gnuradio_VERSION VERSION_LESS "3.10")
     target_link_libraries(${PROJECT_NAME}
         gnuradio::gnuradio-analog

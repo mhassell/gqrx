@@ -73,6 +73,9 @@ receiver::receiver(const std::string input_device,
       d_dc_cancel(false),
       d_iq_balance(false),
       d_demod(RX_DEMOD_OFF)
+#ifdef WITH_SHM_IQ_SINK
+      , shm_connected_(false)
+#endif
 {
 
     tb = gr::make_top_block("gqrx");
@@ -124,16 +127,6 @@ receiver::receiver(const std::string input_device,
     set_af_gain(DEFAULT_AUDIO_GAIN);
 
     audio_udp_sink = make_udp_sink_f();
-
-    /* Create shared memory IQ sink */
-    try {
-        shm_sink = shm_iq_sink::make((unsigned long)d_input_rate);
-        std::cout << "Shared memory IQ sink created successfully" << std::endl;
-    }
-    catch (const std::exception &e) {
-        std::cerr << "Warning: Failed to create shared memory IQ sink: " << e.what() << std::endl;
-        shm_sink.reset();
-    }
 
 #ifdef WITH_PULSEAUDIO
     audio_snk = make_pa_sink(audio_device, d_audio_rate, "GQRX", "Audio output");
@@ -1232,22 +1225,31 @@ receiver::status receiver::start_iq_recording(const std::string filename)
         tb->connect(input_decim, 0, iq_sink, 0);
     else
         tb->connect(src, 0, iq_sink, 0);
-    
-    /* Also start shared memory streaming */
-    if (shm_sink)
-    {
+
+#ifdef WITH_SHM_IQ_SINK
+    /* Lazily create the SHM sink on first use and connect it.
+     * The shm_connected_ flag ensures we never connect it twice. */
+    if (!shm_sink) {
+        try {
+            shm_sink = shm_iq_sink::make((unsigned long)d_input_rate);
+        } catch (const std::exception &e) {
+            std::cerr << "Warning: Failed to create SHM IQ sink: " << e.what() << std::endl;
+        }
+    }
+    if (shm_sink && !shm_connected_) {
         try {
             if (d_decim >= 2)
                 tb->connect(input_decim, 0, gr::basic_block_sptr(shm_sink), 0);
             else
                 tb->connect(src, 0, gr::basic_block_sptr(shm_sink), 0);
+            shm_connected_ = true;
             std::cout << "Shared memory I/Q streaming started" << std::endl;
-        }
-        catch (const std::exception &e) {
-            std::cerr << "Warning: Could not connect shared memory sink: " << e.what() << std::endl;
+        } catch (const std::exception &e) {
+            std::cerr << "Warning: Could not connect SHM sink: " << e.what() << std::endl;
         }
     }
-    
+#endif
+
     d_recording_iq = true;
     tb->unlock();
 
@@ -1270,20 +1272,22 @@ receiver::status receiver::stop_iq_recording()
     else
         tb->disconnect(src, 0, iq_sink, 0);
 
-    /* Disconnect shared memory sink */
-    if (shm_sink)
-    {
+#ifdef WITH_SHM_IQ_SINK
+    if (shm_sink && shm_connected_) {
         try {
             if (d_decim >= 2)
                 tb->disconnect(input_decim, 0, gr::basic_block_sptr(shm_sink), 0);
             else
                 tb->disconnect(src, 0, gr::basic_block_sptr(shm_sink), 0);
             std::cout << "Shared memory I/Q streaming stopped" << std::endl;
+        } catch (const std::exception &e) {
+            std::cerr << "Warning: Error disconnecting SHM sink: " << e.what() << std::endl;
         }
-        catch (const std::exception &e) {
-            std::cerr << "Warning: Error disconnecting shared memory sink: " << e.what() << std::endl;
-        }
+        shm_connected_ = false;
     }
+    /* Destroy the sink so the memfd is freed when streaming stops */
+    shm_sink.reset();
+#endif
 
     tb->unlock();
     iq_sink.reset();
@@ -1392,17 +1396,21 @@ void receiver::connect_all(rx_chain type)
     {
         // We record IQ with minimal pre-processing
         tb->connect(b, 0, iq_sink, 0);
-        
-        // Also stream to shared memory
-        if (shm_sink)
-        {
+
+#ifdef WITH_SHM_IQ_SINK
+        /* Re-connect shm_sink after a disconnect_all().
+         * shm_connected_ was true before the disconnect, so reconnect it exactly
+         * once and update the flag to reflect the new connection. */
+        if (shm_sink && shm_connected_) {
             try {
                 tb->connect(b, 0, gr::basic_block_sptr(shm_sink), 0);
-            }
-            catch (const std::exception &e) {
-                std::cerr << "Warning: Could not connect shared memory sink in connect_all: " << e.what() << std::endl;
+            } catch (const std::exception &e) {
+                std::cerr << "Warning: Could not reconnect SHM sink: "
+                          << e.what() << std::endl;
+                shm_connected_ = false;
             }
         }
+#endif
     }
 
     tb->connect(b, 0, iq_swap, 0);
