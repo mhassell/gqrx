@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 #include <ctime>
+#include <thread>
 
 class ShmRingbuf;
 
@@ -21,6 +22,7 @@ private:
     std::unique_ptr<ShmRingbuf> ringbuf_;
     std::vector<uint8_t>        batch_buf_;     /**< Reusable CU8 conversion buffer */
     time_t                      last_overflow_warn_; /**< For rate-limiting overflow logs */
+    std::thread                 fd_handoff_thread_;  /**< Background SCM_RIGHTS fd sender */
 };
 
 #endif /* INCLUDED_SHM_IQ_SINK_IMPL_H */
