@@ -29,6 +29,30 @@ shm_iq_sink_impl::shm_iq_sink_impl(unsigned long sample_rate)
                      GQRX_IQ_SOCK_DEFAULT " (or $" GQRX_IQ_SOCK_ENV ")\n"
                   << "================================================\n"
                   << std::endl;
+
+        /* Hand the memfd/eventfd pair to an external, already-running
+         * consumer (e.g. rtl_433 started with `-J sock:<path>`) via
+         * SCM_RIGHTS on a short-lived Unix domain socket.
+         *
+         * shm_ringbuf_send_fds() blocks on accept() until a consumer
+         * connects (or indefinitely if none ever does), so it must run on
+         * a background thread rather than the constructor's calling
+         * thread -- otherwise starting IQ recording would hang gqrx until
+         * a consumer attached.
+         *
+         * This thread is intentionally detached: if the sink is destroyed
+         * before a consumer connects, the accept() call simply never
+         * returns and the thread is reaped at process exit. A future
+         * improvement would be to make the accept() interruptible (e.g.
+         * via a self-pipe/eventfd added to a poll() loop) so it can be
+         * cancelled cleanly on stop_iq_recording(). */
+        fd_handoff_thread_ = std::thread([this]() {
+            if (ringbuf_->send_fds() != 0) {
+                std::cerr << "[SHM] Warning: fd handoff via "
+                             GQRX_IQ_SOCK_DEFAULT " failed or no consumer "
+                             "connected" << std::endl;
+            }
+        });
     } catch (const std::exception &e) {
         std::cerr << "Failed to create memfd ring buffer: " << e.what() << std::endl;
         throw;
@@ -37,6 +61,8 @@ shm_iq_sink_impl::shm_iq_sink_impl(unsigned long sample_rate)
 
 shm_iq_sink_impl::~shm_iq_sink_impl()
 {
+    if (fd_handoff_thread_.joinable())
+        fd_handoff_thread_.detach();
     ringbuf_.reset();
 }
 
