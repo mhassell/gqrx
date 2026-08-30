@@ -47,6 +47,7 @@ shm_iq_sink_impl::shm_iq_sink_impl(unsigned long sample_rate)
          * via a self-pipe/eventfd added to a poll() loop) so it can be
          * cancelled cleanly on stop_iq_recording(). */
         fd_handoff_thread_ = std::thread([this]() {
+            std::cerr << "[SHM] fd_handoff_thread_ starting..." << std::endl;
             if (ringbuf_->send_fds() != 0) {
                 std::cerr << "[SHM] Warning: fd handoff via "
                              GQRX_IQ_SOCK_DEFAULT " failed or no consumer "
@@ -77,27 +78,122 @@ int shm_iq_sink_impl::work(int noutput_items,
     if (batch_buf_.size() < needed)
         batch_buf_.resize(needed);
 
+    /* Apply digital gain before quantizing to CU8. Empirically, samples at
+     * this tap point (input_decim/src, pre-AGC) sit far below full scale --
+     * observed noise floor RMS ~0.0045, chirp peaks ~0.04-0.05 -- so the
+     * unscaled CU8 conversion (assuming +/-1.0 full scale) crushes real
+     * signals into only a few LSBs above the 127.5 midpoint. Apply a fixed
+     * gain to use more of the 8-bit dynamic range before clamping.
+     *
+     * TODO: consider replacing this fixed gain with an adaptive/AGC-based
+     * scale if signal levels vary significantly across devices/gain
+     * settings/frequencies. */
+    constexpr float SHM_CU8_GAIN = 16.0f;
+
+    /* --- TEMPORARY DIAGNOSTIC: log amplitude range hitting the CU8
+     * conversion (pre- and post-gain), rate-limited to once per second, so
+     * we can confirm the new scaled range stays within +/-1.0 (no
+     * clipping) while using more of the 8-bit dynamic range than before.
+     * Remove once resolved. */
+    {
+        static time_t last_stats_print = 0;
+        float min_val = 1e9f, max_val = -1e9f;
+        double sum_sq = 0.0;
+        for (int i = 0; i < noutput_items; i++) {
+            float iv = in[i].real();
+            float qv = in[i].imag();
+            min_val = std::min({min_val, iv, qv});
+            max_val = std::max({max_val, iv, qv});
+            sum_sq += (double)iv * iv + (double)qv * qv;
+        }
+        time_t now = time(nullptr);
+        if (now != last_stats_print && noutput_items > 0) {
+            double rms = std::sqrt(sum_sq / (2.0 * noutput_items));
+            std::cerr << "[SHM DIAG] raw min=" << min_val
+                      << " max=" << max_val
+                      << " rms=" << rms
+                      << " | scaled min=" << (min_val * SHM_CU8_GAIN)
+                      << " max=" << (max_val * SHM_CU8_GAIN)
+                      << " rms=" << (rms * SHM_CU8_GAIN)
+                      << (std::abs(min_val * SHM_CU8_GAIN) > 1.0f ||
+                          std::abs(max_val * SHM_CU8_GAIN) > 1.0f
+                              ? "  ** CLIPPING **" : "")
+                      << " (n=" << noutput_items << ")" << std::endl;
+            last_stats_print = now;
+        }
+    }
+    /* --- END TEMPORARY DIAGNOSTIC --- */
+
     /* Batch-convert entire block to CU8.
      * Standard symmetric centering: value * 127.5 + 127.5
      *   full-scale +1.0 → 255, zero carrier → 127.5 (rounds to 127 or 128),
      *   full-scale -1.0 → 0.
      * This matches RTL-SDR hardware output and rtl_433 CU8 expectations. */
     for (int i = 0; i < noutput_items; i++) {
-        float iv = std::max(-1.0f, std::min(1.0f, in[i].real()));
-        float qv = std::max(-1.0f, std::min(1.0f, in[i].imag()));
+        float iv = std::max(-1.0f, std::min(1.0f, in[i].real() * SHM_CU8_GAIN));
+        float qv = std::max(-1.0f, std::min(1.0f, in[i].imag() * SHM_CU8_GAIN));
         batch_buf_[2 * i]     = (uint8_t)(iv * 127.5f + 127.5f);
         batch_buf_[2 * i + 1] = (uint8_t)(qv * 127.5f + 127.5f);
     }
 
-    /* Single write per work() call */
-    ssize_t written = ringbuf_->write(batch_buf_.data(), needed);
-    if (written < 0) {
-        /* Ring buffer full — non-fatal overflow: drop this block and emit a
-         * rate-limited warning (at most once per second). */
+    /* Write the full converted block to the ring buffer, retrying on partial
+     * writes so we never leave a torn I/Q pair in the stream.
+     *
+     * shm_ringbuf_write() may return a *partial* byte count (less than
+     * requested) when the ring buffer doesn't currently have enough free
+     * space for the whole block -- it is not an error, just "wrote what fit".
+     * The previous implementation treated any non-negative return as
+     * success and silently discarded the unwritten remainder. Because CU8
+     * samples are 2 bytes/pair, a partial write that stops on an odd byte
+     * boundary splits an I/Q pair across the gap; every subsequent sample
+     * in the ring buffer is then misaligned by one byte until the consumer
+     * (rtl_433) somehow resynchronizes -- which it cannot do, since there
+     * is no framing/sync marker in the raw CU8 stream. This is consistent
+     * with a signal that "briefly works, then degrades to noise": the
+     * first partial write silently corrupts everything downstream of it.
+     *
+     * Fix: loop until either (a) the entire block has been written, or
+     * (b) the buffer is completely full (EAGAIN) and we deliberately drop
+     * the *whole remaining* block instead of a byte-unaligned fragment of
+     * it. Dropping whole blocks preserves I/Q pair alignment for all
+     * future writes; dropping partial bytes does not. */
+    size_t total_written = 0;
+    while (total_written < needed) {
+        ssize_t written = ringbuf_->write(batch_buf_.data() + total_written,
+                                          needed - total_written);
+        if (written < 0) {
+            /* Buffer full (EAGAIN) or real error: stop here. Whatever
+             * portion of this block was already written is guaranteed to
+             * be a whole number of I/Q pairs, since we only ever advance
+             * total_written by amounts that were themselves confirmed
+             * written below -- so we never re-enter the loop mid-pair. */
+            break;
+        }
+        total_written += (size_t)written;
+    }
+
+    if (total_written < needed) {
+        /* Ring buffer full — non-fatal overflow: drop the unwritten
+         * remainder of this block and emit a rate-limited warning (at
+         * most once per second). Note total_written may be > 0 here; if
+         * it is not itself a multiple of 2 (one CU8 IQ pair), pad/discard
+         * down to the last whole pair boundary before giving up, so we
+         * never leave a torn sample at the tail of the ring buffer either. */
+        size_t aligned_written = total_written - (total_written % 2);
+        if (aligned_written != total_written) {
+            /* This should not normally happen since 'needed' and each
+             * successful partial write from shm_ringbuf_write() operate on
+             * a byte granularity that could in principle split a pair --
+             * guard against it explicitly rather than assume. */
+            total_written = aligned_written;
+        }
+
         time_t now = time(nullptr);
         if (now != last_overflow_warn_) {
-            std::cerr << "[SHM] Ring buffer full, dropping block of "
-                      << noutput_items << " samples" << std::endl;
+            std::cerr << "[SHM] Ring buffer full, dropping "
+                      << (needed - total_written) << " of " << needed
+                      << " bytes (" << noutput_items << "-sample block)"
+                      << std::endl;
             last_overflow_warn_ = now;
         }
     }
